@@ -29,3 +29,19 @@
 Пока секреты `RUNNER_API_URL`/`RUNNER_API_KEY` не заданы, джоба честно отвечает «принято»
 и выходит 0; remote-режим (submit `RunSpec` с engine `fake` → poll status → result) включится
 после деплоя VM-сервиса (runner-jobs#12).
+
+## location (эпик ai-agent-run-api#1, Ф1)
+
+Поле `location` приходит в `client_payload` от `POST /pool/trigger` и валидируется в двух местах:
+на лестнице (400 с именем поля до dispatch'а) и здесь (защита в глубину для ручного
+`workflow_dispatch`).
+
+| `location` | Поведение receiver-джобы |
+|---|---|
+| `""` / не указано | полный запуск: submit в Serverless API → poll → result (наш пул) |
+| `ru` / `eu` / `us` | **regional pool не подключён**: `location_reserved` → `::notice` + step summary + артефакт `location-reserved.json` (только метаданные: location, sha256 и длина task, время) → выход 0, submit **не выполняется** |
+| прочее | отказ шага `location: expected one of …` (job red) |
+
+Задача с зарезервированным регионом **не теряется молча**: запись видна в step summary,
+`::notice`-аннотации и артефакте запуска workflow, лог несёт `location=<значение>`.
+Логика самих регионов не строится — вне скоупа.

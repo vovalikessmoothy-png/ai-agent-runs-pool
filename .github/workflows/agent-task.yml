@@ -4,6 +4,12 @@ name: agent-task
 # (llm-ladder.trainedassist.store/pool/trigger → repository_dispatch сюда) либо ручной запуск.
 # Правило владельца: большие данные (ГБ) НИКОГДА не идут через endpoint/API — только метаданные
 # и presigned-ссылки; здесь task — строка ≤4000 символов, artifactRef — ссылка, не файл.
+#
+# location (эпик ai-agent-run-api#1, Ф1):
+#   ""            → полный запуск в нашем пуле (путь по умолчанию);
+#   ru | eu | us  → регионы зарезервированы: фиксируем location_reserved (notice + summary +
+#                   артефакт только с метаданными) и выходим 0 — запуск НЕ выполняется;
+#   прочее        → отказ шага с именем поля (защита в глубину; основная валидация на лестнице).
 
 on:
   repository_dispatch:
@@ -14,6 +20,11 @@ on:
         description: "Task text (≤4000 chars)"
         required: true
         type: string
+      location:
+        description: 'location: "" | ru | eu | us (пусто = наш пул)'
+        required: false
+        default: ""
+        type: string
 
 permissions:
   contents: read
@@ -23,35 +34,95 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
-      EVENT_NAME: ${{ github.event_name }}
-      EVENT_JSON: ${{ toJSON(github.event) }}
+      # Событие читаем из $GITHUB_EVENT_PATH, а НЕ кладём в env: GitHub печатает env-блок
+      # каждого шага в лог, а логи этой репы публичные — toJSON(github.event) вываливал бы
+      # ПОЛНЫЙ текст задачи мимо обрезки %.500s (кейс C1 эпика ai-agent-run-api#1).
       RUNNER_API_URL: ${{ secrets.RUNNER_API_URL }}
       RUNNER_API_KEY: ${{ secrets.RUNNER_API_KEY }}
     steps:
       - name: Read payload
+        id: payload
         run: |
           set -euo pipefail
-          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
-            TASK=$(jq -r '.inputs.task // empty' <<<"$EVENT_JSON")
+          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
+            TASK=$(jq -r '.inputs.task // empty' "$GITHUB_EVENT_PATH")
+            LOCATION=$(jq -r '.inputs.location // empty' "$GITHUB_EVENT_PATH")
             REPO=""; PROFILE=""; ARTIFACT_REF=""
           else
-            TASK=$(jq -r '.client_payload.task // empty' <<<"$EVENT_JSON")
-            REPO=$(jq -r '.client_payload.repo // empty' <<<"$EVENT_JSON")
-            PROFILE=$(jq -r '.client_payload.profile // empty' <<<"$EVENT_JSON")
-            ARTIFACT_REF=$(jq -r '.client_payload.artifactRef // empty' <<<"$EVENT_JSON")
+            TASK=$(jq -r '.client_payload.task // empty' "$GITHUB_EVENT_PATH")
+            LOCATION=$(jq -r '.client_payload.location // empty' "$GITHUB_EVENT_PATH")
+            REPO=$(jq -r '.client_payload.repo // empty' "$GITHUB_EVENT_PATH")
+            PROFILE=$(jq -r '.client_payload.profile // empty' "$GITHUB_EVENT_PATH")
+            ARTIFACT_REF=$(jq -r '.client_payload.artifactRef // empty' "$GITHUB_EVENT_PATH")
           fi
           if [ -z "$TASK" ]; then
             echo "::error::task is empty — nothing to run"
             exit 1
           fi
+          # Валидация location: отсутствие поля == "" (D4), кривое значение → отказ с именем поля (D3).
+          case "$LOCATION" in
+            ""|ru|eu|us) ;;
+            *)
+              echo "::error::location: expected one of \"\", \"ru\", \"eu\", \"us\", got \"$LOCATION\""
+              exit 1
+              ;;
+          esac
           # Payload в лог: task обрезан до 500 символов. artifactRef как ссылку НЕ печатаем целиком —
           # в ней может быть presigned TTL-токен, а логи этого репозитория публичные: только длина.
+          # location печатаем всегда — это и есть журнал задачи для D1/D2/D4.
+          printf 'location=%s\n' "$LOCATION"
           printf 'task (%d chars): %.500s\n' "${#TASK}" "$TASK"
           printf 'repo=%s profile=%s artifactRef_len=%d\n' "$REPO" "$PROFILE" "${#ARTIFACT_REF}"
           printf '%s' "$TASK" > "$RUNNER_TEMP/task.txt"
+          printf '%s' "$LOCATION" > "$RUNNER_TEMP/location.txt"
+          echo "location=$LOCATION" >> "$GITHUB_OUTPUT"
+
+      - name: "location_reserved — регион не подключён, запуск не выполняется"
+        if: steps.payload.outputs.location != ''
+        env:
+          LOCATION: ${{ steps.payload.outputs.location }}
+        run: |
+          set -euo pipefail
+          TASK_SHA=$(sha256sum "$RUNNER_TEMP/task.txt" | cut -d' ' -f1)
+          TASK_LEN=$(wc -c < "$RUNNER_TEMP/task.txt" | tr -d ' ')
+          ACCEPTED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          RECEIVER_RUN="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          echo "::notice::location_reserved location=$LOCATION — региональный пул не подключён, запуск не выполняется, задача зафиксирована"
+          {
+            echo "### location_reserved"
+            echo ""
+            echo "| Поле | Значение |"
+            echo "|---|---|"
+            echo "| location | \`$LOCATION\` |"
+            echo "| решение | регион зарезервирован, запуск не выполняется |"
+            echo "| task sha256 | \`$TASK_SHA\` |"
+            echo "| task length | $TASK_LEN |"
+            echo "| принято | $ACCEPTED_AT |"
+            echo "| receiver | $RECEIVER_RUN |"
+            echo ""
+            echo "Задача **не потеряна**: запись ниже лежит артефактом \`location-reserved.json\`."
+          } >> "$GITHUB_STEP_SUMMARY"
+          # Только метаданные: текст задачи в публичный артефакт не кладём.
+          jq -n \
+            --arg location "$LOCATION" \
+            --arg taskSha256 "$TASK_SHA" \
+            --argjson taskLength "$TASK_LEN" \
+            --arg acceptedAt "$ACCEPTED_AT" \
+            --arg receiverRun "$RECEIVER_RUN" \
+            '{event:"location_reserved", location:$location, taskSha256:$taskSha256, taskLength:$taskLength, submitted:false, acceptedAt:$acceptedAt, receiverRun:$receiverRun}' \
+            > "$RUNNER_TEMP/location-reserved.json"
+          echo "location_reserved recorded (sha256=$TASK_SHA len=$TASK_LEN)"
+
+      - name: Upload location_reserved record
+        if: steps.payload.outputs.location != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: location-reserved
+          path: ${{ runner.temp }}/location-reserved.json
+          if-no-files-found: error
 
       - name: Run via the runner API (remote mode)
-        if: env.RUNNER_API_URL != '' && env.RUNNER_API_KEY != ''
+        if: env.RUNNER_API_URL != '' && env.RUNNER_API_KEY != '' && steps.payload.outputs.location == ''
         run: |
           set -euo pipefail
           # RunSpec-подмножество (формат trained-assist/ai-agent-runner src/api):
@@ -99,4 +170,12 @@ jobs:
 
       - name: Accepted — RUNNER_API not configured yet
         if: env.RUNNER_API_URL == '' || env.RUNNER_API_KEY == ''
-        run: echo "принято, RUNNER_API настроен не будет до деплоя VM-сервиса (runner-jobs#12)"
+        env:
+          LOCATION: ${{ steps.payload.outputs.location }}
+        run: |
+          set -euo pipefail
+          if [ "$LOCATION" != "" ]; then
+            echo "принято и зафиксировано как location_reserved (location=$LOCATION), RUNNER_API не вызывался"
+          else
+            echo "принято, RUNNER_API настроен не будет до деплоя VM-сервиса (runner-jobs#12)"
+          fi
